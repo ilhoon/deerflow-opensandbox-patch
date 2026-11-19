@@ -1,0 +1,78 @@
+name: build-deerflow-opensandbox-patch
+
+on:
+  schedule:
+    - cron: "0 18 * * *"        # 매일 03:00 KST (UTC 18:00)
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "bytedance/deer-flow git tag (예: v2.2.0)"
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - id: owner
+        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      # ref 입력이 비어 있으면(스케줄 실행 포함) 업스트림 최신 릴리스 태그를 사용
+      - id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          ref="${INPUT_REF:-$(gh api repos/bytedance/deer-flow/releases/latest --jq .tag_name)}"
+          test -n "$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "version=${ref#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 스케줄 실행에서는 이미 빌드한 릴리스면 건너뜀 (수동 실행은 항상 빌드).
+      # 업스트림 이미지가 아직 올라오지 않은 릴리스도 다음 날로 미룸.
+      - id: check
+        env:
+          IMAGE: ghcr.io/${{ steps.owner.outputs.name }}/deer-flow-backend:opensandbox-${{ steps.ref.outputs.version }}
+          BASE: ghcr.io/bytedance/deer-flow-backend:${{ steps.ref.outputs.ref }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$IMAGE already exists; skipping build"
+          elif ! docker manifest inspect "$BASE" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "$BASE is not published yet; skipping build"
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.check.outputs.skip != 'true'
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.check.outputs.skip != 'true'
+
+      # 업스트림 이미지가 linux/amd64 전용이라 amd64만 빌드
+      - uses: docker/build-push-action@v7
+        if: steps.check.outputs.skip != 'true'
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            DEERFLOW_VERSION=${{ steps.ref.outputs.version }}
+          tags: |
+            ghcr.io/${{ steps.owner.outputs.name }}/deer-flow-backend:opensandbox
+            ghcr.io/${{ steps.owner.outputs.name }}/deer-flow-backend:opensandbox-${{ steps.ref.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.ref.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
