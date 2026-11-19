@@ -1,4 +1,4 @@
-"""Tests for deerflow_ext.opensandbox_skills.SkillAwareOpenSandboxProvider.
+"""Tests for deerflow_ext.opensandbox_skills (provider and present_files middleware).
 
 Runs in the Dockerfile ``test`` stage, inside the DeerFlow release image the
 provider is built for (``deerflow_ext`` is importable from /app/backend).
@@ -10,6 +10,8 @@ temporary root, so upload and replacement semantics are exercised for real.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
 import subprocess
 import types
@@ -21,7 +23,7 @@ from typing import Any
 import pytest
 
 from deerflow.config.paths import Paths
-from deerflow_ext.opensandbox_skills import SkillAwareOpenSandboxProvider
+from deerflow_ext.opensandbox_skills import PresentFilesOutputSyncMiddleware, SkillAwareOpenSandboxProvider
 
 
 @dataclass
@@ -60,6 +62,9 @@ class _Files:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
 
+    def read_bytes_stream(self, path: str):
+        yield self._remote.local(path).read_bytes()
+
 
 class _Commands:
     def __init__(self, remote: _Remote) -> None:
@@ -69,7 +74,11 @@ class _Commands:
         if command == "true":
             return _Execution()
         if "__DF_OUTPUT_SYNC__" in command:
-            return _Execution(logs=_Logs(stdout=[_Message("\n__DF_OUTPUT_SYNC__:0:0:0")]))
+            # The provider's listing contract: base64 of NUL-terminated remote paths.
+            outputs = self._remote.local("/mnt/user-data/outputs")
+            paths = sorted(f"/mnt/user-data/outputs/{p.relative_to(outputs).as_posix()}" for p in outputs.rglob("*") if p.is_file()) if outputs.is_dir() else []
+            listing = base64.b64encode("".join(f"{p}\0" for p in paths).encode()).decode()
+            return _Execution(logs=_Logs(stdout=[_Message(f"{listing}\n__DF_OUTPUT_SYNC__:0:0:0")]))
         if "tar -xzf" in command and any(f"-C {root} " in command for root in self._remote.fail_extract_into):
             return _Execution(exit_code=1, logs=_Logs(stderr=[_Message("tar: injected failure")]))
         mapped = command.replace("/mnt/", f"{self._remote.root}/mnt/").replace("/tmp/deerflow-upload-", f"{self._remote.root}/tmp/deerflow-upload-")
@@ -294,3 +303,54 @@ def test_unsafe_skills_root_is_rejected(env, root: str) -> None:
     env.skills_root = root
     with pytest.raises(ValueError, match="skills.container_path"):
         env.new_provider()
+
+
+def _tool_request(name: str, sandbox_id: str | None) -> types.SimpleNamespace:
+    state = {"sandbox": {"sandbox_id": sandbox_id}} if sandbox_id else {}
+    return types.SimpleNamespace(tool_call={"name": name, "args": {}, "id": "call-1"}, runtime=types.SimpleNamespace(state=state, context={}))
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_present_files_sees_outputs_on_gateway_before_tool_runs(env, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    provider = env.new_provider()
+    sandbox_id = provider.acquire("thread", user_id="owner")
+    remote = env.sdk.remotes[0]
+    image = remote.local("/mnt/user-data/outputs/images/cat.jpg")
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\xff\xd8jpeg")
+    monkeypatch.setattr("deerflow_ext.opensandbox_skills.get_sandbox_provider", lambda: provider)
+    host_image = env.paths.sandbox_outputs_dir("thread", user_id="owner") / "images/cat.jpg"
+    seen: list[bytes] = []
+
+    def handler(request):
+        seen.append(host_image.read_bytes())
+        return "presented"
+
+    async def ahandler(request):
+        return handler(request)
+
+    middleware = PresentFilesOutputSyncMiddleware()
+    request = _tool_request("present_files", sandbox_id)
+    result = middleware.wrap_tool_call(request, handler) if mode == "sync" else asyncio.run(middleware.awrap_tool_call(request, ahandler))
+
+    assert result == "presented"
+    assert seen == [b"\xff\xd8jpeg"], "the artifact must exist on the Gateway when present_files publishes it"
+
+
+def test_other_tools_skip_sync_and_sync_failure_keeps_presenting(env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    calls: list[str] = []
+
+    class _Provider:
+        def sync_outputs(self, sandbox_id: str) -> None:
+            calls.append(sandbox_id)
+            raise OSError("listing failed")
+
+    monkeypatch.setattr("deerflow_ext.opensandbox_skills.get_sandbox_provider", lambda: _Provider())
+    middleware = PresentFilesOutputSyncMiddleware()
+
+    assert middleware.wrap_tool_call(_tool_request("bash", "sb-1"), lambda request: "ran") == "ran"
+    assert calls == []
+    with caplog.at_level(logging.WARNING, logger="deerflow_ext.opensandbox_skills"):
+        assert middleware.wrap_tool_call(_tool_request("present_files", "sb-1"), lambda request: "presented") == "presented"
+    assert calls == ["sb-1"]
+    assert "Could not mirror OpenSandbox outputs" in caplog.text

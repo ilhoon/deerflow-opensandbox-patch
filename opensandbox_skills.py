@@ -10,12 +10,19 @@ thread's uploads and outputs. This subclass adds both, mirroring
 - every acquire refreshes the user's shared skills projection (skipped when the
   projection is unchanged, and for threads with an Agent skill policy view);
 - ``sync_agent_skills`` replaces the managed skill categories with a per-Agent
-  projection, so the provider can enforce Agent skill isolation.
+  projection, so the provider can enforce Agent skill isolation;
+- ``PresentFilesOutputSyncMiddleware`` mirrors the remote outputs to the Gateway
+  before ``present_files`` returns. Upstream mirrors them only when the turn
+  ends, so the UI's immediate artifact request would otherwise 404.
 
-Select it with::
+Select them with::
 
+    # config.yaml
     sandbox:
       use: deerflow_ext.opensandbox_skills:SkillAwareOpenSandboxProvider
+
+    # extensions_config.json
+    "middlewares": ["deerflow_ext.opensandbox_skills:PresentFilesOutputSyncMiddleware"]
 
 It overrides private hooks of the upstream provider (``_load_config``,
 ``_create_sandbox``, ``_acquire_scope_locked``); the image build runs
@@ -24,6 +31,7 @@ It overrides private hooks of the upstream provider (``_load_config``,
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -35,13 +43,19 @@ import tempfile
 import threading
 import uuid
 import weakref
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from langchain.agents.middleware import AgentMiddleware
 
 from deerflow.community.opensandbox.provider import OpenSandboxProvider
 from deerflow.community.opensandbox.sandbox import OpenSandboxSandbox, execution_stdout
 from deerflow.config import get_app_config
 from deerflow.constants import DEFAULT_SKILLS_CONTAINER_PATH
+from deerflow.sandbox.overwrite import unwrap_sandbox
+from deerflow.sandbox.sandbox_provider import get_sandbox_provider
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +178,15 @@ class SkillAwareOpenSandboxProvider(OpenSandboxProvider):
                 raise RuntimeError(f"OpenSandbox {sandbox_id} is not available for skill synchronization")
             self._upload_skills(sandbox, projection)
 
+    def sync_outputs(self, sandbox_id: str) -> None:
+        """Mirror an active sandbox's outputs to the Gateway now, not only at release."""
+        with self._lock:
+            sandbox = self._sandboxes.get(sandbox_id)
+            scope = next((key for key, value in self._thread_sandboxes.items() if value == sandbox_id), None)
+        if sandbox is None or scope is None or not scope[0]:
+            return
+        self._sync_outputs_to_host(sandbox, user_id=scope[0], thread_id=scope[1])
+
     # ── Skills ───────────────────────────────────────────────────────────
 
     def _upload_shared_skills(self, sandbox: OpenSandboxSandbox, *, thread_id: str, user_id: str) -> None:
@@ -277,4 +300,50 @@ class SkillAwareOpenSandboxProvider(OpenSandboxProvider):
             raise RuntimeError(f"OpenSandbox upload into {dest_root} failed with exit code {exit_code}")
 
 
-__all__ = ["SkillAwareOpenSandboxProvider"]
+def _request_sandbox_id(request: Any) -> str | None:
+    runtime = getattr(request, "runtime", None)
+    state = getattr(runtime, "state", None)
+    if isinstance(state, dict):
+        sandbox_state, _ = unwrap_sandbox(state.get("sandbox"))
+        if isinstance(sandbox_state, dict) and sandbox_state.get("sandbox_id"):
+            return sandbox_state["sandbox_id"]
+    context = getattr(runtime, "context", None)
+    sandbox_id = context.get("sandbox_id") if isinstance(context, dict) else None
+    return sandbox_id if isinstance(sandbox_id, str) and sandbox_id else None
+
+
+class PresentFilesOutputSyncMiddleware(AgentMiddleware):
+    """Mirror remote outputs before ``present_files`` publishes artifact paths.
+
+    The Gateway serves artifacts from its own disk, and upstream copies remote
+    outputs there only when the turn releases the sandbox. Syncing right before
+    the tool runs makes the presented files exist when the UI requests them.
+    No-op for providers without ``sync_outputs`` and for every other tool.
+    """
+
+    tool_name = "present_files"
+
+    def _sync(self, request: Any) -> None:
+        if (getattr(request, "tool_call", None) or {}).get("name") != self.tool_name:
+            return
+        sandbox_id = _request_sandbox_id(request)
+        if sandbox_id is None:
+            return
+        try:
+            sync = getattr(get_sandbox_provider(), "sync_outputs", None)
+            if sync is not None:
+                sync(sandbox_id)
+        except Exception:
+            # Presentation must not fail: release still mirrors at turn end.
+            logger.warning("Could not mirror OpenSandbox outputs before present_files for %s", sandbox_id, exc_info=True)
+
+    def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        self._sync(request)
+        return handler(request)
+
+    async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
+        await asyncio.to_thread(self._sync, request)
+        return await handler(request)
+
+
+__all__ = ["PresentFilesOutputSyncMiddleware", "SkillAwareOpenSandboxProvider"]
